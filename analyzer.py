@@ -5,6 +5,8 @@ from collections import defaultdict
 import time
 import zipfile
 import tempfile
+import json
+from collections import defaultdict
 
 MOBSF_URL = "http://localhost:8000"
 API_KEY = "41032d28d94892ba199dac242e73c5343cc9fb5d30b4b56bb18f0a21fa6c29a9"
@@ -25,7 +27,7 @@ def upload_apk(file_path):
 
         r = requests.post(url, headers=headers, files=files)
 
-    # Debug help (VERY useful for 400 errors)
+
     if r.status_code != 200:
         print("Upload failed response:", r.text)
 
@@ -161,35 +163,167 @@ def save_json(app_name, report):
         json.dump(report, f, indent=4)
 
 
-def summarize(report):
-    counts = {
-        "high": 0,
-        "warning": 0,
-        "info": 0
+def download_pdf_report(hash_value, app_name):
+    url = f"{MOBSF_URL}/api/v1/download_pdf"
+
+    data = {
+        "hash": hash_value
     }
 
-    def process_findings(findings):
-        for f in findings or []:
-            if isinstance(f, dict):
-                severity = (f.get("severity") or "").lower()
-                if severity in counts:
-                    counts[severity] += 1
-                else:
-                    counts["info"] += 1  # fallback
+    r = requests.post(url, headers=headers, data=data)
 
-    # -------------------------
-    # CODE ANALYSIS
-    # -------------------------
-    code = report.get("code_analysis", {})
-    process_findings(code.get("findings"))
+    if r.status_code != 200:
+        print(f"PDF generation failed for {app_name}: {r.text}")
+        return None
 
-    # -------------------------
-    # MANIFEST ANALYSIS
-    # -------------------------
-    manifest = report.get("manifest_analysis", {})
-    process_findings(manifest.get("manifest_findings"))
+    os.makedirs("pdf_reports", exist_ok=True)
 
-    return counts
+    safe_name = app_name.replace("/", "_")
+    path = os.path.join("pdf_reports", f"{safe_name}.pdf")
+
+    with open(path, "wb") as f:
+        f.write(r.content)
+
+    return path
+
+
+def summarize(report):
+    """
+    Summarizes key security metrics from a MobSF JSON report.
+    """
+    counts = {"high": 0, "warning": 0, "info": 0}
+
+    def add_from_summary(summary_obj):
+        if summary_obj:
+            for sev in ["high", "warning", "info"]:
+                counts[sev] += summary_obj.get(sev, 0)
+
+    # Extract existing summaries from different analysis modules
+    add_from_summary(report.get("manifest_analysis", {}).get("manifest_summary"))
+    add_from_summary(report.get("network_security", {}).get("network_summary"))
+    add_from_summary(report.get("certificate_analysis", {}).get("certificate_summary"))
+
+    # Process individual code analysis findings
+    code_findings = report.get("code_analysis", {}).get("findings", [])
+    for f in (code_findings or []):
+        if isinstance(f, dict):
+            severity = (f.get("severity") or "info").lower()
+            counts[severity if severity in counts else "info"] += 1
+
+    # Count vulnerabilities in shared libraries (NX, PIE, Stack Canary, etc.)
+    binary_vulns = 0
+    for lib in report.get("binary_analysis", []):
+        for check in lib.values():
+            if isinstance(check, dict) and check.get("severity") in ["high", "warning"]:
+                binary_vulns += 1
+
+    # Count permissions flagged as 'dangerous'
+    permissions = report.get("permissions", {})
+    dangerous_perms = sum(1 for p in permissions.values() if p.get("status") == "dangerous")
+
+    return {
+        "high_findings": counts["high"],
+        "warning_findings": counts["warning"],
+        "info_findings": counts["info"],
+        "binary_vulnerabilities": binary_vulns,
+        "dangerous_permissions": dangerous_perms,
+        "malware_perms_count": report.get("malware_permissions", {}).get("total_malware_permissions", 0),
+        "trackers": report.get("trackers", 0),
+        "total_trackers": report.get("total_trackers", 0),
+        "security_score": report.get("security_score", 0),
+        "package_name": report.get("package_name", "N/A"),
+        "version": report.get("version_name", "N/A")
+    }
+
+def main():
+    apk_folder = "apks"
+    
+    # ---------------------------
+    # 1. INITIALIZE DATA
+    # ---------------------------
+    # upload_folder, get_scans, scan_apk, wait_for_report, 
+    # save_json, download_pdf_report are assumed to be defined.
+    
+    uploads = upload_folder(apk_folder)
+    uploaded_hashes = {u["hash"] for u in uploads if u.get("hash")}
+    existing_scans = get_scans()
+
+    existing_hashes = set()
+    combined = []
+
+    for app in existing_scans:
+        md5 = app.get("MD5")
+        if md5:
+            existing_hashes.add(md5)
+            combined.append({"file_name": app.get("FILE_NAME"), "hash": md5})
+
+    for app in uploads:
+        if app.get("hash") and app["hash"] not in existing_hashes:
+            combined.append(app)
+
+    # ---------------------------
+    # 2. PROCESS APPS
+    # ---------------------------
+    totals = defaultdict(int)
+    per_app = {}
+    seen_hashes = set()
+    scores = []
+
+    print(f"\nTotal unique apps to process: {len(combined)}\n")
+
+    for app in combined:
+        app_name = app["file_name"]
+        hash_val = app["hash"]
+
+        if not hash_val or hash_val in seen_hashes:
+            continue
+        seen_hashes.add(hash_val)
+
+        print(f"[*] Processing: {app_name}")
+        try:
+            if hash_val in uploaded_hashes:
+                scan_apk(hash_val)
+
+            report = wait_for_report(hash_val)
+            save_json(app_name, report)
+            download_pdf_report(hash_val, app_name)
+
+            summary = summarize(report)
+            per_app[app_name] = summary
+            scores.append(summary["security_score"])
+
+            for k, v in summary.items():
+                if isinstance(v, (int, float)):
+                    totals[k] += v
+
+        except Exception as e:
+            print(f"[!] Error processing {app_name}: {e}")
+
+    # ---------------------------
+    # 3. FINAL SUMMARY OUTPUT
+    # ---------------------------
+    print("\n" + "="*30)
+    print("      PER-APP ANALYSIS")
+    print("="*30)
+    for app, data in per_app.items():
+        print(f"\n[+] {app} ({data['package_name']} v{data['version']})")
+        print(f"    Score: {data['security_score']}/100")
+        print(f"    Vulnerabilities: {data['high_findings']} High, {data['warning_findings']} Warning")
+        print(f"    Privacy: {data['trackers']} Trackers, {data['dangerous_permissions']} Dangerous Perms")
+
+    print("\n" + "="*30)
+    print("      AGGREGATED TOTALS")
+    print("="*30)
+    for k, v in totals.items():
+        if k != "security_score":
+            print(f"{k.replace('_', ' ').title()}: {v}")
+    
+    if scores:
+        avg_score = sum(scores) / len(scores)
+        print(f"Average Security Score: {avg_score:.2f}/100")
+
+if __name__ == "__main__":
+    main()
 
 # ---------------------------
 # MAIN
@@ -198,7 +332,14 @@ def main():
     apk_folder = "apks"
 
     # ---------------------------
-    # 1. EXISTING SCANS IN MOBSF
+    # 1. UPLOAD NEW APKs FIRST
+    # ---------------------------
+    uploads = upload_folder(apk_folder)
+
+    uploaded_hashes = set(u["hash"] for u in uploads if u.get("hash"))
+
+    # ---------------------------
+    # 2. EXISTING SCANS IN MOBSF
     # ---------------------------
     existing_scans = get_scans()
 
@@ -209,29 +350,33 @@ def main():
         md5 = app.get("MD5")
         if md5:
             existing_hashes.add(md5)
+
             combined.append({
                 "file_name": app.get("FILE_NAME"),
                 "hash": md5
             })
 
     # ---------------------------
-    # 2. UPLOAD NEW APKs
+    # 3. ADD NEW UPLOADS (NO DUPLICATES)
     # ---------------------------
-    uploads = upload_folder(apk_folder)
-
     for app in uploads:
+        if not app.get("hash"):
+            continue
+
         if app["hash"] not in existing_hashes:
             combined.append(app)
         else:
             print(f"Skipping already scanned: {app['file_name']}")
 
     # ---------------------------
-    # 3. PROCESS EVERYTHING
+    # 4. PROCESS EVERYTHING
     # ---------------------------
     totals = defaultdict(int)
     per_app = {}
 
     print(f"\nTotal apps to process: {len(combined)}\n")
+
+    seen = set()
 
     for app in combined:
         app_name = app["file_name"]
@@ -240,16 +385,27 @@ def main():
         if not hash_value:
             continue
 
+        # 🔥 HARD DEDUPE BY HASH
+        if hash_value in seen:
+            print(f"Skipping duplicate hash: {app_name}")
+            continue
+
+        seen.add(hash_value)
+
         print(f"Processing {app_name}")
 
         try:
-            # Only scan if NOT already scanned
-            if app_name in [u["file_name"] for u in uploads]:
+            # Only scan NEW uploads
+            if hash_value in uploaded_hashes:
                 scan_apk(hash_value)
 
             report = wait_for_report(hash_value)
 
             save_json(app_name, report)
+
+            pdf_path = download_pdf_report(hash_value, app_name)
+            if pdf_path:
+                print(f"PDF saved: {pdf_path}")
 
             summary = summarize(report)
             per_app[app_name] = summary
