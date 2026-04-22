@@ -6,9 +6,6 @@ import tempfile
 import requests
 from collections import defaultdict
 
-# =========================
-# CONFIGURATION
-# =========================
 MOBSF_URL = "http://localhost:8000" #Change port if port is different in MobSF docker
 API_KEY = "41032d28d94892ba199dac242e73c5343cc9fb5d30b4b56bb18f0a21fa6c29a9" # To find API key go to your MobSF GUI and click API on top bar
 
@@ -16,14 +13,11 @@ HEADERS = {
     "Authorization": API_KEY
 }
 
-OUTPUT_DIR = "json_reports"
-
-
 # =========================
 # APK UPLOAD & EXTRACTION
 # =========================
-def upload_apk(file_path):
-    url = f"{MOBSF_URL}/api/v1/upload"
+def upload_file(file_path): #Uses mobsf upload api to upload file but this doenst start a scan
+    url = f"{MOBSF_URL}/api/v1/upload" 
 
     with open(file_path, "rb") as f:
         files = {
@@ -33,7 +27,7 @@ def upload_apk(file_path):
         r = requests.post(url, headers=HEADERS, files=files)
 
     if r.status_code != 200:
-        print("Upload failed response:", r.text)
+        print("Upload failed:", r.text)
 
     r.raise_for_status()
     result = r.json()
@@ -44,7 +38,7 @@ def upload_apk(file_path):
     }
 
 
-def extract_apkm(apkm_path):
+def extract_apk(apkm_path):#this finds the apk file in the .apkm file
     temp_dir = tempfile.mkdtemp()
 
     with zipfile.ZipFile(apkm_path, 'r') as zip_ref:
@@ -57,7 +51,7 @@ def extract_apkm(apkm_path):
     return None
 
 
-def upload_folder(folder_path):
+def upload_folder(folder_path): #This looks for the apk files in the apks folder and runs extract apk if its a apkm
     uploads = []
 
     for file in os.listdir(folder_path):
@@ -69,7 +63,7 @@ def upload_folder(folder_path):
 
         elif file.endswith(".apkm"):
             print(f"Extracting APKM: {file}")
-            target_path = extract_apkm(full_path)
+            target_path = extract_apk(full_path)
 
             if not target_path:
                 print(f"Failed to extract: {file}")
@@ -80,7 +74,7 @@ def upload_folder(folder_path):
         print(f"Uploading {file}...")
 
         try:
-            result = upload_apk(target_path)
+            result = upload_file(target_path)
             uploads.append(result)
         except Exception as e:
             print(f"Failed to upload {file}: {e}")
@@ -89,9 +83,9 @@ def upload_folder(folder_path):
 
 
 # =========================
-# SCANNING & REPORTING
+# SCANNING 
 # =========================
-def scan_apk(hash_value):
+def scan_apk(hash_value): #initiates the scan using mobsf api
     url = f"{MOBSF_URL}/api/v1/scan"
 
     data = {"hash": hash_value}
@@ -104,7 +98,7 @@ def scan_apk(hash_value):
     return r.json()
 
 
-def wait_for_report(hash_value, timeout=30):
+def wait_for_report_completion(hash_value, timeout=30): #wait fors scan to finish
     url = f"{MOBSF_URL}/api/v1/report_json"
 
     for _ in range(timeout):
@@ -118,7 +112,7 @@ def wait_for_report(hash_value, timeout=30):
     raise Exception("Scan timed out for hash: " + hash_value)
 
 
-def get_scans():
+def get_scans(): #gets completed scans
     url = f"{MOBSF_URL}/api/v1/scans"
 
     r = requests.get(url, headers=HEADERS)
@@ -127,7 +121,7 @@ def get_scans():
     return r.json().get("content", [])
 
 
-def get_report(hash_value):
+def get_report(hash_value): #gets the json report
     url = f"{MOBSF_URL}/api/v1/report_json"
 
     r = requests.post(url, headers=HEADERS, data={"hash": hash_value})
@@ -136,20 +130,20 @@ def get_report(hash_value):
     return r.json()
 
 
-# =========================
-# OUTPUT HANDLING
-# =========================
-def save_json(app_name, report):
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ========================
+# OUTPUT 
+# ========================
+def save_json(app_name, report): #saves json report to folder
+    os.makedirs("json_reports", exist_ok=True)
 
     safe_name = app_name.replace("/", "_")
-    path = os.path.join(OUTPUT_DIR, f"{safe_name}.json")
+    path = os.path.join("json_reports", f"{safe_name}.json")
 
     with open(path, "w") as f:
         json.dump(report, f, indent=4)
 
 
-def download_pdf_report(hash_value, app_name):
+def download_pdf_report(hash_value, app_name): #downloads pdf report
     url = f"{MOBSF_URL}/api/v1/download_pdf"
 
     r = requests.post(url, headers=HEADERS, data={"hash": hash_value})
@@ -172,45 +166,30 @@ def download_pdf_report(hash_value, app_name):
 # =========================
 # REPORT ANALYSIS
 # =========================
-def summarize(report):
-    counts = {"high": 0, "warning": 0, "info": 0}
-
-    def add_from_summary(summary_obj):
-        if summary_obj:
-            for sev in ["high", "warning", "info"]:
-                counts[sev] += summary_obj.get(sev, 0)
-
-    add_from_summary(report.get("manifest_analysis", {}).get("manifest_summary"))
-    add_from_summary(report.get("network_security", {}).get("network_summary"))
-    add_from_summary(report.get("certificate_analysis", {}).get("certificate_summary"))
-
-    code_findings = report.get("code_analysis", {}).get("findings", [])
-    for f in (code_findings or []):
-        if isinstance(f, dict):
-            severity = (f.get("severity") or "info").lower()
-            counts[severity if severity in counts else "info"] += 1
-
-    binary_vulns = 0
-    for lib in report.get("binary_analysis", []):
-        for check in lib.values():
-            if isinstance(check, dict) and check.get("severity") in ["high", "warning"]:
-                binary_vulns += 1
+def summarize(report): #looks through json report to find importatn risk
 
     permissions = report.get("permissions", {})
     dangerous_perms = sum(1 for p in permissions.values() if p.get("status") == "dangerous")
+    appsec = report.get("appsec", {})
+    High_Risk    = len(appsec.get("high", []))
+    Warning = len(appsec.get("warning", []))
+    Info    = len(appsec.get("info", []))
+    hardcoded_secrets = len(report.get("secrets", []))
+    total_domains = len(report.get("domains", {}))
 
     return {
-        "high_findings": counts["high"],
-        "warning_findings": counts["warning"],
-        "info_findings": counts["info"],
-        "binary_vulnerabilities": binary_vulns,
-        "dangerous_permissions": dangerous_perms,
-        "malware_perms_count": report.get("malware_permissions", {}).get("total_malware_permissions", 0),
-        "trackers": report.get("trackers", 0),
-        "total_trackers": report.get("total_trackers", 0),
-        "security_score": report.get("security_score", 0),
-        "package_name": report.get("package_name", "N/A"),
-        "version": report.get("version_name", "N/A")
+        "security_score":        report.get("security_score", 0),
+        "High Risk":           High_Risk,
+        "Warning":          Warning,
+        "Info":           Info,
+        "Dangerous Permissions": dangerous_perms,
+        "Hardcoded Secrets":     hardcoded_secrets,
+        "Malware Permissions count":   report.get("malware_permissions", {}).get("total_malware_permissions", 0),
+        "Trackers":              report.get("trackers", 0),
+        "Total trackers":       report.get("total_trackers", 0),
+        "Total domains":        total_domains,
+        "Package Name":        report.get("package_name", "N/A"),
+        "Version":               report.get("version_name", "N/A"),
     }
 
 
@@ -222,9 +201,7 @@ def main():
 
     uploads = upload_folder(apk_folder)
     uploaded_hashes = set(u["hash"] for u in uploads if u.get("hash"))
-
     existing_scans = get_scans()
-
     existing_hashes = set()
     combined = []
 
@@ -249,7 +226,7 @@ def main():
     totals = defaultdict(int)
     per_app = {}
 
-    print(f"\nTotal apps to process: {len(combined)}\n")
+    print(f"\nTotal amount of Apps: {len(combined)}\n")
 
     seen = set()
 
@@ -272,8 +249,7 @@ def main():
             if hash_value in uploaded_hashes:
                 scan_apk(hash_value)
 
-            report = wait_for_report(hash_value)
-
+            report = wait_for_report_completion(hash_value)
             save_json(app_name, report)
 
             pdf_path = download_pdf_report(hash_value, app_name)
@@ -284,10 +260,11 @@ def main():
             per_app[app_name] = summary
 
             for k, v in summary.items():
-                totals[k] += v
+                if isinstance(v, (int, float)):
+                    totals[k] += v
 
-        except Exception as e:
-            print(f"Failed on {app_name}: {e}")
+        except Exception:
+            print(f"\n")
 
     print("\n=== PER APP ===")
     for app, data in per_app.items():
