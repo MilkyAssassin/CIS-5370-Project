@@ -7,7 +7,7 @@ import requests
 from collections import defaultdict
 
 MOBSF_URL = "http://localhost:8000" #Change port if port is different in MobSF docker
-API_KEY = "41032d28d94892ba199dac242e73c5343cc9fb5d30b4b56bb18f0a21fa6c29a9" # To find API key go to your MobSF GUI and click API on top bar
+API_KEY = "apipkey" # To find API key go to your MobSF GUI and click API on top bar
 
 HEADERS = {
     "Authorization": API_KEY
